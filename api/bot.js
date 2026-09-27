@@ -15,7 +15,7 @@ function isBotCommand(text, cmd) {
 
 const NEW_NOTE_BTN = "Новая заметка";
 const DELETE_NOTE_BTN = "Удалить заметку";
-const DEFAULT_LIST = "Входящие";
+const DEFAULT_LIST = "Стикеры";
 const MAX_KB_BTN = 64;
 
 const CHAT_PRIMARY = "qwen/qwen3.8-27b";
@@ -31,9 +31,9 @@ const SYSTEM_PROMPT = `Ты помощник по спискам заметок.
 
 Правила:
 - action=add — добавить заметку; note обязателен.
-- action=show — показать список; list если назван, иначе «Входящие».
+- action=show — показать список; list если назван, иначе «Стикеры».
 - action=new_list — создать пустой список с именем list.
-- action=delete_last — удалить ПОСЛЕДНЮЮ заметку в list (если list не назван — «Входящие»).
+- action=delete_last — удалить ПОСЛЕДНЮЮ заметку в list (если list не назван — «Стикеры»).
 - action=delete_note — удалить ОДНУ заметку: index (номер с 1) и/или query (кусок текста); list если указан.
 - action=clear_list — ТОЛЬКО если явно просят очистить весь список; list обязателен.
 - action=rename_list — переименовать: list = старое имя, new_name = новое («переименуй X в Y», «назови X Y»).
@@ -42,7 +42,7 @@ const SYSTEM_PROMPT = `Ты помощник по спискам заметок.
 - action=move_list_top — поднять список наверх своей группы («подними X», «X наверх»).
 - action=help — если неясно.
 - Не выдумывай заметки, которых нет в контексте списков.
-- Если список не назван для add — list = «Входящие».
+- Если список не назван для add — list = «Стикеры».
 - Пиши list/new_name/note/query на русском.
 
 Пунктуация note (жёстко для action=add):
@@ -143,7 +143,32 @@ function getState(chatId) {
   }
   st.order = next;
   st.starred = st.starred.filter((n) => !!st.lists[n]);
+  migrateIncomingToStickers(st);
   return st;
+}
+
+const LEGACY_DEFAULT = "Входящие";
+
+function migrateIncomingToStickers(st) {
+  if (!st.lists || !Object.prototype.hasOwnProperty.call(st.lists, LEGACY_DEFAULT)) {
+    return;
+  }
+  const legacyNotes = Array.isArray(st.lists[LEGACY_DEFAULT])
+    ? st.lists[LEGACY_DEFAULT]
+    : [];
+  if (!Array.isArray(st.lists[DEFAULT_LIST])) {
+    st.lists[DEFAULT_LIST] = legacyNotes.slice();
+  } else {
+    st.lists[DEFAULT_LIST] = st.lists[DEFAULT_LIST].concat(legacyNotes);
+  }
+  delete st.lists[LEGACY_DEFAULT];
+  st.order = (st.order || [])
+    .map((n) => (n === LEGACY_DEFAULT ? DEFAULT_LIST : n))
+    .filter((n, i, arr) => n && arr.indexOf(n) === i);
+  if (!st.order.includes(DEFAULT_LIST)) st.order.unshift(DEFAULT_LIST);
+  st.starred = (st.starred || [])
+    .map((n) => (n === LEGACY_DEFAULT ? DEFAULT_LIST : n))
+    .filter((n, i, arr) => n && arr.indexOf(n) === i && st.lists[n]);
 }
 
 async function sendMessage(chatId, text, extra) {
@@ -243,6 +268,63 @@ function formatList(state, name, notes) {
   return "«" + escapeHtml(title) + "»:\n" + body;
 }
 
+function clipShort(label, max) {
+  const s = String(label || "");
+  const m = max || 28;
+  if (s.length <= m) return s;
+  return s.slice(0, m - 1) + "…";
+}
+
+/** Inline grid only for default «Стикеры» list. */
+function stickersInlineKeyboard(notes) {
+  const rows = [];
+  const n = notes.length;
+  if (n <= 4) {
+    for (let i = 0; i < n; i++) {
+      rows.push([
+        { text: clipBtn(notes[i]), callback_data: "sn:" + i },
+      ]);
+    }
+  } else {
+    for (let i = 0; i < n; i += 2) {
+      const row = [
+        { text: clipShort(notes[i], 28), callback_data: "sn:" + i },
+      ];
+      if (i + 1 < n) {
+        row.push({
+          text: clipShort(notes[i + 1], 28),
+          callback_data: "sn:" + (i + 1),
+        });
+      }
+      rows.push(row);
+    }
+  }
+  return { inline_keyboard: rows };
+}
+
+async function showListMessage(chatId, state, name) {
+  const notes = state.lists[name] || [];
+  if (name === DEFAULT_LIST) {
+    const title = displayListName(state, name);
+    if (!notes.length) {
+      await sendMessage(
+        chatId,
+        "«" + escapeHtml(title) + "»: пусто.",
+        { reply_markup: keyboardFor(state) }
+      );
+      return;
+    }
+    // Inline under message; persistent reply keyboard stays from earlier messages.
+    await sendMessage(chatId, "«" + escapeHtml(title) + "» — выберите стикер:", {
+      reply_markup: stickersInlineKeyboard(notes),
+    });
+    return;
+  }
+  await sendMessage(chatId, formatList(state, name, notes), {
+    reply_markup: keyboardFor(state),
+  });
+}
+
 function listsSnapshot(state) {
   return listNames(state)
     .map((name) => {
@@ -287,7 +369,8 @@ function findNoteMatches(state, listHint, query, index) {
 }
 
 function ensureList(state, name) {
-  const listName = (name && String(name).trim()) || DEFAULT_LIST;
+  let listName = (name && String(name).trim()) || DEFAULT_LIST;
+  if (listName === LEGACY_DEFAULT) listName = DEFAULT_LIST;
   if (!Array.isArray(state.lists[listName])) {
     state.lists[listName] = [];
   }
@@ -493,9 +576,7 @@ async function applyIntent(chatId, state, intent) {
 
   if (action === "show") {
     const name = ensureList(state, intent.list || DEFAULT_LIST);
-    await sendMessage(chatId, formatList(state, name, state.lists[name] || []), {
-      reply_markup: keyboardFor(state),
-    });
+    await showListMessage(chatId, state, name);
     return;
   }
 
@@ -873,7 +954,27 @@ async function handleDeletePrompt(chatId) {
 async function handleShowList(chatId, listName) {
   const state = getState(chatId);
   const name = ensureList(state, listName);
-  await sendMessage(chatId, formatList(state, name, state.lists[name] || []), {
+  await showListMessage(chatId, state, name);
+}
+
+async function handleCallbackQuery(cq) {
+  if (!cq || !cq.message || !cq.message.chat) return;
+  const chatId = cq.message.chat.id;
+  const data = String(cq.data || "");
+  try {
+    await tg("answerCallbackQuery", { callback_query_id: cq.id });
+  } catch (_) {}
+  const state = getState(chatId);
+  if (!data.startsWith("sn:")) return;
+  const idx = Number(data.slice(3));
+  const notes = state.lists[DEFAULT_LIST] || [];
+  if (!Number.isFinite(idx) || idx < 0 || idx >= notes.length) {
+    await sendMessage(chatId, "Этой заметки уже нет.", {
+      reply_markup: keyboardFor(state),
+    });
+    return;
+  }
+  await sendMessage(chatId, escapeHtml(notes[idx]), {
     reply_markup: keyboardFor(state),
   });
 }
@@ -974,7 +1075,7 @@ module.exports = async function handler(req, res) {
       const url = webhookPublicUrl();
       const result = await tg("setWebhook", {
         url,
-        allowed_updates: ["message"],
+        allowed_updates: ["message", "callback_query"],
         drop_pending_updates: false,
       });
       return res.status(200).json({
@@ -1010,7 +1111,9 @@ module.exports = async function handler(req, res) {
   if (!update || typeof update !== "object") update = {};
 
   try {
-    if (update.message) {
+    if (update.callback_query) {
+      await handleCallbackQuery(update.callback_query);
+    } else if (update.message) {
       await handleMessage(update.message);
     }
     return res.status(200).json({ ok: true });
