@@ -7,7 +7,9 @@
 const store = new Map();
 
 const NEW_NOTE_BTN = "Новая заметка";
+const DELETE_NOTE_BTN = "Удалить заметку";
 const DEFAULT_LIST = "Входящие";
+const MAX_KB_BTN = 64;
 
 const CHAT_PRIMARY = "qwen/qwen3.8-27b";
 const CHAT_FALLBACK = "openai/gpt-oss-20b";
@@ -18,17 +20,19 @@ const GROQ_TRANSCRIBE_URL =
   "https://api.groq.com/openai/v1/audio/transcriptions";
 
 const SYSTEM_PROMPT = `Ты помощник по спискам заметок. Ответь СТРОГО одним JSON-объектом без markdown:
-{"action":"add"|"show"|"new_list"|"delete_last"|"help","list":"string","note":"string"}
+{"action":"add"|"show"|"new_list"|"delete_last"|"delete_note"|"clear_list"|"help","list":"string","note":"string","index":null|number,"query":"string"}
 
 Правила:
-- action=add — добавить заметку в список; note обязателен (исправь пунктуацию, не выдумывай фактов).
-- action=show — показать список; list = имя списка, если упомянуто, иначе «Входящие».
+- action=add — добавить заметку; note обязателен (пунктуация ок, факты не выдумывать).
+- action=show — показать список; list если назван, иначе «Входящие».
 - action=new_list — создать пустой список с именем list.
-- action=delete_last — удалить последнюю заметку из list (если имя не названо — «Входящие»).
-- action=help — если неясно, что делать.
+- action=delete_last — удалить ПОСЛЕДНЮЮ заметку в list (если list не назван — «Входящие»).
+- action=delete_note — удалить ОДНУ заметку: index (номер с 1) и/или query (кусок текста); list если указан.
+- action=clear_list — ТОЛЬКО если явно просят очистить весь список; list обязателен.
+- action=help — если неясно.
+- Не выдумывай заметки, которых нет в контексте списков.
 - Если список не назван для add — list = «Входящие».
-- Не выдумывай факты; note только из сообщения пользователя (с правкой пунктуации).
-- Пиши list и note на русском, как в сообщении.`;
+- Пиши list/note/query на русском.`;
 
 function token() {
   return process.env.TELEGRAM_BOT_TOKEN || "";
@@ -84,6 +88,7 @@ function getState(chatId) {
     store.set(key, {
       lists: { [DEFAULT_LIST]: [] },
       step: null,
+      pendingDeletes: null,
       warnedEphemeral: false,
     });
   }
@@ -106,20 +111,107 @@ async function sendMessage(chatId, text, extra) {
   });
 }
 
-function mainKeyboard() {
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function clipBtn(label) {
+  const s = String(label || "");
+  if (s.length <= MAX_KB_BTN) return s;
+  return s.slice(0, MAX_KB_BTN - 1) + "…";
+}
+
+function listNames(state) {
+  const names = Object.keys((state && state.lists) || {});
+  if (!names.includes(DEFAULT_LIST)) names.unshift(DEFAULT_LIST);
+  names.sort((a, b) => {
+    if (a === DEFAULT_LIST) return -1;
+    if (b === DEFAULT_LIST) return 1;
+    return a.localeCompare(b, "ru");
+  });
+  return names.filter((n, i, arr) => arr.indexOf(n) === i);
+}
+
+function keyboardFor(state) {
+  const rows = [[{ text: NEW_NOTE_BTN }, { text: DELETE_NOTE_BTN }]];
+  const names = listNames(state);
+  for (let i = 0; i < names.length; i += 2) {
+    const chunk = [{ text: clipBtn(names[i]) }];
+    if (names[i + 1]) chunk.push({ text: clipBtn(names[i + 1]) });
+    rows.push(chunk);
+  }
   return {
-    keyboard: [[{ text: NEW_NOTE_BTN }]],
+    keyboard: rows,
     resize_keyboard: true,
     is_persistent: true,
     one_time_keyboard: false,
   };
 }
 
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+function kb(chatId) {
+  return keyboardFor(getState(chatId));
+}
+
+function resolveListButton(state, text) {
+  const names = listNames(state);
+  if (names.includes(text)) return text;
+  for (const n of names) {
+    if (clipBtn(n) === text) return n;
+  }
+  return null;
+}
+
+function formatList(name, notes) {
+  if (!notes.length) return "«" + escapeHtml(name) + "»: пусто.";
+  const body = notes
+    .map((n, i) => i + 1 + ". " + escapeHtml(n))
+    .join("\n");
+  return "«" + escapeHtml(name) + "»:\n" + body;
+}
+
+function listsSnapshot(state) {
+  return listNames(state)
+    .map((name) => {
+      const notes = state.lists[name] || [];
+      if (!notes.length) return "— " + name + ": (пусто)";
+      return (
+        "— " +
+        name +
+        ":\n" +
+        notes.map((n, i) => "  " + (i + 1) + ". " + n).join("\n")
+      );
+    })
+    .join("\n");
+}
+
+function findNoteMatches(state, listHint, query, index) {
+  const q = String(query || "").trim().toLowerCase();
+  const hasIndex = index != null && Number.isFinite(Number(index));
+  const names =
+    listHint && Array.isArray(state.lists[listHint])
+      ? [listHint]
+      : listNames(state);
+  const hits = [];
+  for (const name of names) {
+    const notes = state.lists[name] || [];
+    if (hasIndex) {
+      const i = Number(index) - 1;
+      if (i >= 0 && i < notes.length) {
+        hits.push({ list: name, index: i, note: notes[i] });
+      }
+      continue;
+    }
+    if (!q) continue;
+    notes.forEach((note, i) => {
+      if (String(note).toLowerCase().includes(q)) {
+        hits.push({ list: name, index: i, note });
+      }
+    });
+  }
+  return hits;
 }
 
 function ensureList(state, name) {
@@ -136,7 +228,7 @@ async function maybeWarnEphemeral(chatId, state) {
   await sendMessage(
     chatId,
     "Пока списки в памяти сервера — после перезапуска могут пропасть.",
-    { reply_markup: mainKeyboard() }
+    { reply_markup: keyboardFor(state) }
   );
 }
 
@@ -220,6 +312,7 @@ async function transcribe(buf, filename, mime) {
   throw new Error("http_" + (lastHttp || 0));
 }
 
+
 async function callChat(model, userText) {
   const key = groqKey();
   if (!key) throw new Error("no_groq");
@@ -248,18 +341,40 @@ function parseIntent(raw) {
   }
   const data = JSON.parse(text);
   const action = String(data.action || "help").toLowerCase();
-  const allowed = ["add", "show", "new_list", "delete_last", "help"];
+  const allowed = [
+    "add",
+    "show",
+    "new_list",
+    "delete_last",
+    "delete_note",
+    "clear_list",
+    "help",
+  ];
+  let index = null;
+  if (data.index != null && data.index !== "") {
+    const n = Number(data.index);
+    if (Number.isFinite(n)) index = n;
+  }
   return {
     action: allowed.includes(action) ? action : "help",
     list: typeof data.list === "string" ? data.list.trim() : "",
     note: typeof data.note === "string" ? data.note.trim() : "",
+    query: typeof data.query === "string" ? data.query.trim() : "",
+    index,
   };
 }
 
-async function interpret(userText) {
-  let res = await callChat(CHAT_PRIMARY, userText);
+async function interpret(userText, state, hint) {
+  const snapshot = listsSnapshot(state);
+  const payload =
+    (hint ? "Контекст: " + hint + "\n\n" : "") +
+    "Текущие списки:\n" +
+    snapshot +
+    "\n\nСообщение пользователя:\n" +
+    userText;
+  let res = await callChat(CHAT_PRIMARY, payload);
   if (res.status === 404) {
-    res = await callChat(CHAT_FALLBACK, userText);
+    res = await callChat(CHAT_FALLBACK, payload);
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -276,48 +391,53 @@ async function interpret(userText) {
 function helpText() {
   return (
     "Пришлите голосовое или текст.\n" +
-    "Примеры: «в записнуху купить фильтр», «покажи записнуху».\n" +
-    "Кнопка «Новая заметка» — начать новую запись."
+    "Примеры: «в записнуху купить фильтр», «покажи записнуху», «удали молоко из записнухи».\n" +
+    "Кнопки внизу: новая заметка, удалить, и ваши списки."
   );
 }
 
 async function applyIntent(chatId, state, intent) {
   const action = intent.action;
   if (action === "help") {
-    await sendMessage(chatId, helpText(), { reply_markup: mainKeyboard() });
+    await sendMessage(chatId, helpText(), { reply_markup: keyboardFor(state) });
     return;
   }
 
   if (action === "new_list") {
     const name = ensureList(state, intent.list || "Новый список");
-    await sendMessage(
-      chatId,
-      "Список «" + escapeHtml(name) + "» готов.",
-      { reply_markup: mainKeyboard() }
-    );
+    await sendMessage(chatId, "Список «" + escapeHtml(name) + "» готов.", {
+      reply_markup: keyboardFor(state),
+    });
     await maybeWarnEphemeral(chatId, state);
     return;
   }
 
   if (action === "show") {
     const name = ensureList(state, intent.list || DEFAULT_LIST);
-    const notes = state.lists[name] || [];
-    if (!notes.length) {
+    await sendMessage(chatId, formatList(name, state.lists[name] || []), {
+      reply_markup: keyboardFor(state),
+    });
+    return;
+  }
+
+  if (action === "clear_list") {
+    if (!intent.list) {
       await sendMessage(
         chatId,
-        "«" + escapeHtml(name) + "»: пусто.",
-        { reply_markup: mainKeyboard() }
+        "Какой список очистить целиком? Напишите имя.",
+        { reply_markup: keyboardFor(state) }
       );
       return;
     }
-    const body = notes
-      .map((n, i) => i + 1 + ". " + escapeHtml(n))
-      .join("\n");
+    const name = ensureList(state, intent.list);
+    const n = (state.lists[name] || []).length;
+    state.lists[name] = [];
     await sendMessage(
       chatId,
-      "«" + escapeHtml(name) + "»:\n" + body,
-      { reply_markup: mainKeyboard() }
+      "Очистил «" + escapeHtml(name) + "» (" + n + ").",
+      { reply_markup: keyboardFor(state) }
     );
+    await maybeWarnEphemeral(chatId, state);
     return;
   }
 
@@ -328,31 +448,100 @@ async function applyIntent(chatId, state, intent) {
       await sendMessage(
         chatId,
         "В «" + escapeHtml(name) + "» нечего удалять.",
-        { reply_markup: mainKeyboard() }
+        { reply_markup: keyboardFor(state) }
       );
       return;
     }
     const removed = notes.pop();
     await sendMessage(
       chatId,
-      "Удалил из «" +
-        escapeHtml(name) +
-        "»: " +
-        escapeHtml(removed),
-      { reply_markup: mainKeyboard() }
+      "Удалил из «" + escapeHtml(name) + "»: " + escapeHtml(removed),
+      { reply_markup: keyboardFor(state) }
     );
     await maybeWarnEphemeral(chatId, state);
     return;
   }
 
-  // add
+  if (action === "delete_note") {
+    const listHint =
+      intent.list && Array.isArray(state.lists[intent.list])
+        ? intent.list
+        : "";
+    const query = intent.query || intent.note || "";
+    const hits = findNoteMatches(
+      state,
+      listHint || null,
+      query,
+      intent.index
+    );
+
+    if (!hits.length) {
+      await sendMessage(
+        chatId,
+        "Не нашёл такую заметку. Уточните номер, кусок текста или список.",
+        { reply_markup: keyboardFor(state) }
+      );
+      return;
+    }
+
+    if (hits.length > 1) {
+      const options = hits.slice(0, 3);
+      state.step = "await_delete_pick";
+      state.pendingDeletes = options;
+      const lines = options
+        .map(
+          (h, i) =>
+            i +
+            1 +
+            ") «" +
+            escapeHtml(h.list) +
+            "» #" +
+            (h.index + 1) +
+            ": " +
+            escapeHtml(h.note)
+        )
+        .join("\n");
+      await sendMessage(
+        chatId,
+        "Нашёл несколько. Какую удалить? Ответьте номером варианта:\n" +
+          lines,
+        { reply_markup: keyboardFor(state) }
+      );
+      return;
+    }
+
+    const hit = hits[0];
+    const arr = state.lists[hit.list] || [];
+    if (arr[hit.index] !== hit.note) {
+      await sendMessage(
+        chatId,
+        "Заметка уже изменилась. Покажите список и попробуйте ещё раз.",
+        { reply_markup: keyboardFor(state) }
+      );
+      return;
+    }
+    arr.splice(hit.index, 1);
+    state.step = null;
+    state.pendingDeletes = null;
+    await sendMessage(
+      chatId,
+      "Удалил из «" +
+        escapeHtml(hit.list) +
+        "»: " +
+        escapeHtml(hit.note),
+      { reply_markup: keyboardFor(state) }
+    );
+    await maybeWarnEphemeral(chatId, state);
+    return;
+  }
+
   const name = ensureList(state, intent.list || DEFAULT_LIST);
   const note = (intent.note || "").trim();
   if (!note) {
     await sendMessage(
       chatId,
       "Не понял текст заметки. Пришлите ещё раз голосом или текстом.",
-      { reply_markup: mainKeyboard() }
+      { reply_markup: keyboardFor(state) }
     );
     return;
   }
@@ -360,7 +549,7 @@ async function applyIntent(chatId, state, intent) {
   await sendMessage(
     chatId,
     "Добавил в «" + escapeHtml(name) + "»: " + escapeHtml(note),
-    { reply_markup: mainKeyboard() }
+    { reply_markup: keyboardFor(state) }
   );
   await maybeWarnEphemeral(chatId, state);
 }
@@ -370,20 +559,64 @@ async function processUserText(chatId, text) {
     await sendMessage(
       chatId,
       "Сервис временно недоступен: не настроен ключ Groq.",
-      { reply_markup: mainKeyboard() }
+      { reply_markup: kb(chatId) }
     );
     return;
   }
   const state = getState(chatId);
-  state.step = null;
+
+  if (state.step === "await_delete_pick" && state.pendingDeletes) {
+    const m = String(text || "").trim().match(/^[1-3]$/);
+    if (m) {
+      const pick = Number(m[0]) - 1;
+      const hit = state.pendingDeletes[pick];
+      state.step = null;
+      state.pendingDeletes = null;
+      if (!hit) {
+        await sendMessage(chatId, "Нет такого варианта.", {
+          reply_markup: keyboardFor(state),
+        });
+        return;
+      }
+      const arr = state.lists[hit.list] || [];
+      const at = arr.indexOf(hit.note);
+      if (at < 0) {
+        await sendMessage(
+          chatId,
+          "Эта заметка уже удалена или изменилась.",
+          { reply_markup: keyboardFor(state) }
+        );
+        return;
+      }
+      arr.splice(at, 1);
+      await sendMessage(
+        chatId,
+        "Удалил из «" +
+          escapeHtml(hit.list) +
+          "»: " +
+          escapeHtml(hit.note),
+        { reply_markup: keyboardFor(state) }
+      );
+      return;
+    }
+  }
+
+  const deleteHint =
+    state.step === "await_delete"
+      ? "Пользователь удаляет заметку. Выбери delete_note, delete_last или clear_list."
+      : "";
+  if (state.step === "await_delete" || state.step === "await_note") {
+    state.step = null;
+  }
+
   let intent;
   try {
-    intent = await interpret(text);
+    intent = await interpret(text, state, deleteHint);
   } catch (_) {
     await sendMessage(
       chatId,
       "Не удалось разобрать сообщение. Попробуйте ещё раз чуть позже.",
-      { reply_markup: mainKeyboard() }
+      { reply_markup: keyboardFor(state) }
     );
     return;
   }
@@ -391,31 +624,54 @@ async function processUserText(chatId, text) {
 }
 
 async function handleStart(chatId) {
-  getState(chatId).step = null;
+  const state = getState(chatId);
+  state.step = null;
+  state.pendingDeletes = null;
   await sendMessage(
     chatId,
     "Пришлите голосовое или текст.\n" +
-      "Примеры: «в записнуху купить фильтр», «покажи записнуху».",
-    { reply_markup: mainKeyboard() }
+      "Примеры: «в записнуху купить фильтр», «покажи записнуху», «удали молоко из записнухи».",
+    { reply_markup: keyboardFor(state) }
   );
 }
 
 async function handleCancel(chatId) {
   const state = getState(chatId);
   state.step = null;
+  state.pendingDeletes = null;
   await sendMessage(chatId, "Ок, отменил.", {
-    reply_markup: mainKeyboard(),
+    reply_markup: keyboardFor(state),
   });
 }
 
 async function handleNewNote(chatId) {
   const state = getState(chatId);
   state.step = "await_note";
+  state.pendingDeletes = null;
   await sendMessage(
     chatId,
     "Пришлите голосовое или текст для заметки.",
-    { reply_markup: mainKeyboard() }
+    { reply_markup: keyboardFor(state) }
   );
+}
+
+async function handleDeletePrompt(chatId) {
+  const state = getState(chatId);
+  state.step = "await_delete";
+  state.pendingDeletes = null;
+  await sendMessage(
+    chatId,
+    "Какую удалить? Можно голосом или текстом: номер, кусок текста или список целиком.",
+    { reply_markup: keyboardFor(state) }
+  );
+}
+
+async function handleShowList(chatId, listName) {
+  const state = getState(chatId);
+  const name = ensureList(state, listName);
+  await sendMessage(chatId, formatList(name, state.lists[name] || []), {
+    reply_markup: keyboardFor(state),
+  });
 }
 
 async function handleMessage(message) {
@@ -440,6 +696,18 @@ async function handleMessage(message) {
     await handleNewNote(chatId);
     return;
   }
+  if (text === DELETE_NOTE_BTN) {
+    await handleDeletePrompt(chatId);
+    return;
+  }
+  if (text) {
+    const state = getState(chatId);
+    const listHit = resolveListButton(state, text);
+    if (listHit) {
+      await handleShowList(chatId, listHit);
+      return;
+    }
+  }
 
   if (message.voice || message.audio) {
     const fileId =
@@ -450,13 +718,13 @@ async function handleMessage(message) {
       await sendMessage(
         chatId,
         "Сервис временно недоступен: не настроен ключ Groq.",
-        { reply_markup: mainKeyboard() }
+        { reply_markup: kb(chatId) }
       );
       return;
     }
     try {
       await sendMessage(chatId, "Слушаю…", {
-        reply_markup: mainKeyboard(),
+        reply_markup: kb(chatId),
       });
       const { buf, filename, mime } = await downloadVoice(fileId);
       const transcript = await transcribe(buf, filename, mime);
@@ -471,7 +739,7 @@ async function handleMessage(message) {
       } else {
         msg = "Не удалось обработать голосовое (" + code + ").";
       }
-      await sendMessage(chatId, msg, { reply_markup: mainKeyboard() });
+      await sendMessage(chatId, msg, { reply_markup: kb(chatId) });
     }
     return;
   }
@@ -524,10 +792,7 @@ module.exports = async function handler(req, res) {
   }
 
   if (!token()) {
-    return res.status(503).json({
-      ok: false,
-      error: "TELEGRAM_BOT_TOKEN не задан",
-    });
+    return res.status(503).json({ ok: false, error: "no_token" });
   }
 
   let update = req.body;
@@ -546,10 +811,10 @@ module.exports = async function handler(req, res) {
     }
     return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error("bot error", err && err.message ? err.message : err);
+    console.error("bot error", err);
     return res.status(200).json({
       ok: false,
-      error: "handler_error",
+      error: String((err && err.message) || err),
     });
   }
 };
