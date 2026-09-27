@@ -11,7 +11,7 @@ const DEFAULT_LIST = "Входящие";
 
 const CHAT_PRIMARY = "qwen/qwen3.8-27b";
 const CHAT_FALLBACK = "openai/gpt-oss-20b";
-const WHISPER_MODELS = ["whisper-large-v3", "whisper-large-v3-turbo"];
+const WHISPER_MODELS = ["whisper-large-v3-turbo", "whisper-large-v3"];
 
 const GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_TRANSCRIBE_URL =
@@ -147,18 +147,20 @@ async function downloadVoice(fileId) {
   const t = token();
   const url = `https://api.telegram.org/file/bot${t}/${filePath}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error("voice_download_failed");
+  if (!res.ok) throw new Error("http_" + res.status);
   const buf = Buffer.from(await res.arrayBuffer());
-  const ext = (filePath.split(".").pop() || "ogg").toLowerCase();
-  const mime =
-    ext === "oga" || ext === "ogg"
-      ? "audio/ogg"
-      : ext === "mp3"
-        ? "audio/mpeg"
-        : ext === "m4a" || ext === "mp4"
-          ? "audio/mp4"
-          : "application/octet-stream";
-  return { buf, filename: "voice." + ext, mime };
+  // Telegram voice notes are ogg/opus (.oga). Groq expects a clear audio/* + extension.
+  const extRaw = (filePath.split(".").pop() || "ogg").toLowerCase();
+  const isOgg = extRaw === "oga" || extRaw === "ogg" || extRaw === "opus";
+  const filename = isOgg ? "voice.ogg" : "voice." + extRaw;
+  const mime = isOgg
+    ? "audio/ogg"
+    : extRaw === "mp3"
+      ? "audio/mpeg"
+      : extRaw === "m4a" || extRaw === "mp4" || extRaw === "mp4a"
+        ? "audio/mp4"
+        : "audio/ogg";
+  return { buf, filename, mime };
 }
 
 async function transcribe(buf, filename, mime) {
@@ -166,32 +168,56 @@ async function transcribe(buf, filename, mime) {
   if (!key) {
     throw new Error("no_groq");
   }
-  let lastErr = "transcribe_failed";
+
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  const name = filename || "voice.ogg";
+  const type = mime || "audio/ogg";
+  let lastHttp = 0;
+
   for (const model of WHISPER_MODELS) {
-    const form = new FormData();
-    form.append("file", new Blob([new Uint8Array(buf)], { type: mime }), filename);
-    form.append("model", model);
-    form.append("language", "ru");
-    form.append("response_format", "json");
-    const res = await fetch(GROQ_TRANSCRIBE_URL, {
-      method: "POST",
-      headers: { Authorization: "Bearer " + key },
-      body: form,
-    });
-    if (res.status === 404) {
-      lastErr = "whisper_404";
-      continue;
+    // Try with language=ru first; on HTTP 400 retry the same model without language.
+    for (const withLang of [true, false]) {
+      const form = new FormData();
+      const file =
+        typeof File !== "undefined"
+          ? new File([bytes], name, { type })
+          : new Blob([bytes], { type });
+      form.append("file", file, name);
+      form.append("model", model);
+      form.append("response_format", "json");
+      if (withLang) form.append("language", "ru");
+
+      const res = await fetch(GROQ_TRANSCRIBE_URL, {
+        method: "POST",
+        headers: { Authorization: "Bearer " + key },
+        body: form,
+      });
+      lastHttp = res.status;
+
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const textOut = (data && data.text ? String(data.text) : "").trim();
+        if (textOut) return textOut;
+        // empty body — try next variant/model
+        if (withLang) continue;
+        break;
+      }
+
+      // drain body so the connection can close cleanly
+      await res.text().catch(() => "");
+
+      if (res.status === 400 && withLang) {
+        continue; // same model, without language=ru
+      }
+      if (res.status === 404) {
+        break; // next model
+      }
+      // other errors: try next model
+      break;
     }
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      lastErr = "whisper_http_" + res.status;
-      continue;
-    }
-    const text = (data && data.text ? String(data.text) : "").trim();
-    if (text) return text;
-    lastErr = "empty_transcript";
   }
-  throw new Error(lastErr);
+
+  throw new Error("http_" + (lastHttp || 0));
 }
 
 async function callChat(model, userText) {
@@ -437,9 +463,13 @@ async function handleMessage(message) {
       await processUserText(chatId, transcript);
     } catch (err) {
       const code = String((err && err.message) || err);
-      let msg = "Не удалось обработать голосовое. Попробуйте ещё раз.";
+      let msg;
       if (code === "no_groq") {
         msg = "Сервис временно недоступен: не настроен ключ Groq.";
+      } else if (code.startsWith("http_")) {
+        msg = "Не удалось обработать голосовое (" + code.slice(5) + ").";
+      } else {
+        msg = "Не удалось обработать голосовое (" + code + ").";
       }
       await sendMessage(chatId, msg, { reply_markup: mainKeyboard() });
     }
