@@ -19,7 +19,7 @@ const GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_TRANSCRIBE_URL =
   "https://api.groq.com/openai/v1/audio/transcriptions";
 
-const SYSTEM_PROMPT = `Ты помощник по спискам заметок. Ответь СТРОГО одним JSON-объектом без markdown:
+const SYSTEM_PROMPT = `Ты помощник по спискам заметок. Отвечь СТРОГО одним JSON-объектом без markdown:
 {"action":"add"|"show"|"new_list"|"delete_last"|"delete_note"|"clear_list"|"help","list":"string","note":"string","index":null|number,"query":"string"}
 
 Правила:
@@ -169,7 +169,7 @@ function formatList(name, notes) {
   const body = notes
     .map((n, i) => i + 1 + ". " + escapeHtml(n))
     .join("\n");
-  return "«" + escapeHtml(name) + "»:\n" + body;
+  return "«" + escapeHtml(name) + ":\n" + body;
 }
 
 function listsSnapshot(state) {
@@ -336,7 +336,7 @@ async function callChat(model, userText) {
 
 function parseIntent(raw) {
   let text = String(raw || "").trim();
-  if (text.startsWith("```")) {
+  if (text.startsWith("```") ) {
     text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   }
   const data = JSON.parse(text);
@@ -391,7 +391,7 @@ async function interpret(userText, state, hint) {
 function helpText() {
   return (
     "Пришлите голосовое или текст.\n" +
-    "Примеры: «в записнуху купить фильтр», «покажи записнуху», «удали молоко из записнухи».\n" +
+    "Примеры: «в покупки купить фильтр», «покажи покупки», «удали молоко из покупок».\n" +
     "Кнопки внизу: новая заметка, удалить, и ваши списки."
   );
 }
@@ -630,7 +630,7 @@ async function handleStart(chatId) {
   await sendMessage(
     chatId,
     "Пришлите голосовое или текст.\n" +
-      "Примеры: «в записнуху купить фильтр», «покажи записнуху», «удали молоко из записнухи».",
+      "Примеры: «в покупки купить фильтр», «покажи покупки», «удали молоко из покупок».",
     { reply_markup: keyboardFor(state) }
   );
 }
