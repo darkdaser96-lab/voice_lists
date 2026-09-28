@@ -1,6 +1,6 @@
 # voice_lists
 
-Telegram-бот голосовых и текстовых заметок по спискам. Вебхук на Vercel: голос → Groq Whisper, команды → Groq chat (один JSON), списки и заметки в **Supabase** (таблицы `lists` / `notes`).
+Telegram-бот голосовых и текстовых заметок по спискам. Вебхук на Vercel: голос → Groq Whisper, команды → Groq chat (один JSON), списки и заметки в **Supabase** (таблицы `lists` / `notes` / `reminders`).
 
 ## Что умеет
 
@@ -11,13 +11,14 @@ Telegram-бот голосовых и текстовых заметок по с�
 - **Переименовать** — «переименуй покупки в дела»; если имя занято или старого нет — отказ без затирания.
 - **Избранное** — «покупки в избранное» / «убери звезду с покупок»; на кнопке и в «покажи» префикс ★.
 - **Поднять список** — «подними покупки»; избранные сверху, внутри группы ручной порядок.
+- **Напоминания** — «напомни завтра в 10 позвонить», «напомни 29 сентября в 18:00 оплатить счёт». Время всегда Europe/Moscow; если время неясно — бот спросит, не угадывает. Пишет в `reminders` и дублирует текст в список «Напоминания».
 - **Пунктуация** — в `note` модель правит знаки, смысл и слова не выдумывает.
 
 Клавиатура: «Новая заметка», «Удалить заметку», затем списки (★ у избранных). Отмена: `/cancel`.
 
 ## База (Supabase)
 
-Клиент ходит только в schema **public**: `from('lists')` / `from('notes')` → PostgREST `/rest/v1/lists` и `/rest/v1/notes`. Без выдуманных путей и без DDL из кода.
+Клиент ходит только в schema **public**: `from('lists')` / `from('notes')` / `from('reminders')` → PostgREST `/rest/v1/...`. Без выдуманных путей и без DDL из кода.
 
 ### Один раз: создать таблицы в Dashboard
 
@@ -56,11 +57,25 @@ grant usage, select on all sequences in schema public to service_role;
 
 В RAM на инстансе остаются только шаги UI (`step`, `pendingDeletes`). Ключи **никогда** не кладутся в Git/HTML.
 
+
+## Напоминания
+
+Таблица `public.reminders` уже должна быть создана (колонки как минимум: `chat_id` text, `body` text, `fire_at` timestamptz, `sent` boolean; желательно `id`). Код **не** создаёт таблицу сам.
+
+Планировщик (cron / внешний scheduler) периодически дергает:
+
+`GET` или `POST` https://voice-lists-ten.vercel.app/api/remind
+
+Эндпоинт выбирает непросланные (`sent=false`) с `fire_at <= now`, шлёт в Telegram «Напоминание: …» и ставит `sent=true`. Часовой пояс интерпретации фраз — **Europe/Moscow**.
+
+Примеры фраз: «напомни завтра в 10 позвонить врачу», «напомни сегодня в 18 купить молоко», «напомни 29 сентября в 15:30».
+
 ## Сайт и бот
 
 - Лендинг: https://voice-lists-ten.vercel.app  
 - Бот: https://t.me/voice_lists_bot  
 - Вебхук: `POST/GET` https://voice-lists-ten.vercel.app/api/bot  
+- Напоминания (cron): `GET/POST` https://voice-lists-ten.vercel.app/api/remind  
 
 ## Env (Vercel, не в Git)
 

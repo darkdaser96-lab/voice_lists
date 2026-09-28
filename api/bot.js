@@ -5,6 +5,13 @@
  * Lists/notes persist in Supabase; step/pendingDeletes/warnedEphemeral stay in RAM.
  */
 
+const {
+  supabaseConfigured,
+  sbHeaders,
+  sbFrom,
+  sbRest,
+} = require("./_sb");
+
 /** Ephemeral per-chat UI state only (not lists/notes). */
 const ephemeral = new Map();
 
@@ -29,7 +36,7 @@ const GROQ_TRANSCRIBE_URL =
   "https://api.groq.com/openai/v1/audio/transcriptions";
 
 const SYSTEM_PROMPT = `Ты помощник по спискам заметок. Ответь СТРОГО одним JSON-объектом без markdown:
-{"action":"add"|"show"|"new_list"|"delete_last"|"delete_note"|"clear_list"|"rename_list"|"star_list"|"unstar_list"|"move_list_top"|"help","list":"string","new_name":"string","note":"string","index":null|number,"query":"string"}
+{"action":"add"|"show"|"new_list"|"delete_last"|"delete_note"|"clear_list"|"rename_list"|"star_list"|"unstar_list"|"move_list_top"|"remind"|"help","list":"string","new_name":"string","note":"string","index":null|number,"query":"string","fire_at":null|string}
 
 Правила:
 - action=add — добавить заметку; note обязателен.
@@ -42,12 +49,13 @@ const SYSTEM_PROMPT = `Ты помощник по спискам заметок.
 - action=star_list — добавить список в избранное («X в избранное», «звезда на X»).
 - action=unstar_list — убрать из избранного («убери звезду с X»).
 - action=move_list_top — поднять список наверх своей группы («подними X», «X наверх»).
+- action=remind — напоминание на время: note = текст напоминания; fire_at = ISO 8601 С оффсетом Europe/Moscow (пример 2026-09-29T10:00:00+03:00). Разрешай «завтра», «сегодня», «29 сентября» относительно текущего времени из контекста. Если время неясное или неоднозначное — НЕ выдумывай fire_at: поставь fire_at=null (или пустую строку), note заполни если текст ясен. Никогда не угадывай время.
 - action=help — если неясно.
 - Не выдумывай заметки, которых нет в контексте списков.
 - Если список не назван для add — list = «Стикеры».
 - Пиши list/new_name/note/query на русском.
 
-Пунктуация note (жёстко для action=add):
+Пунктуация note (жёстко для action=add и remind):
 - Исправь пунктуацию, НЕ меняя смысл и НЕ выдумывая слова.
 - Точка в конце предложения; запятые в перечислениях; не заменяй все запятые на «и».
 - Вопросительный/восклицательный знак — только если по тону фразы ясно.
@@ -72,83 +80,6 @@ function webhookPublicUrl() {
     process.env.WEBHOOK_URL ||
     "https://voice-lists-ten.vercel.app/api/bot"
   );
-}
-
-function supabaseUrl() {
-  let u = String(process.env.SUPABASE_URL || "").trim().replace(/\/$/, "");
-  if (!u) return "";
-  // Project URL only — strip accidental /rest/v1; reject postgres URIs.
-  if (/^postgres(ql)?:\/\//i.test(u)) return "";
-  u = u.replace(/\/rest\/v1\/?$/i, "");
-  return u;
-}
-
-function supabaseKey() {
-  return process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-}
-
-function supabaseConfigured() {
-  return Boolean(supabaseUrl() && supabaseKey());
-}
-
-function sbHeaders(extra) {
-  const key = supabaseKey();
-  return Object.assign(
-    {
-      apikey: key,
-      Authorization: "Bearer " + key,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      "Accept-Profile": "public",
-      "Content-Profile": "public",
-      Prefer: "return=representation",
-    },
-    extra || {}
-  );
-}
-
-/** PostgREST like supabase.from(table) — schema public only. */
-function sbFrom(table) {
-  return "/rest/v1/" + table;
-}
-
-async function sbRest(pathAndQuery, opts) {
-  const base = supabaseUrl();
-  if (!base || !supabaseKey()) {
-    const err = new Error("no_supabase");
-    throw err;
-  }
-  const method = (opts && opts.method) || "GET";
-  const headers = sbHeaders(opts && opts.headers);
-  const init = { method, headers };
-  if (opts && opts.body != null) {
-    init.body =
-      typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body);
-  }
-  const url = base + pathAndQuery;
-  const res = await fetch(url, init);
-  const text = await res.text().catch(() => "");
-  let data = null;
-  if (text) {
-    try {
-      data = JSON.parse(text);
-    } catch (_) {
-      data = text;
-    }
-  }
-  if (!res.ok) {
-    const detail =
-      (data && data.message) ||
-      (data && data.hint) ||
-      (data && data.error_description) ||
-      (typeof data === "string" ? data.slice(0, 200) : "") ||
-      "HTTP " + res.status;
-    const err = new Error("supabase_" + res.status + ": " + detail);
-    err.status = res.status;
-    err.body = data;
-    throw err;
-  }
-  return data;
 }
 
 /** Probe public.lists via select — no invented DDL paths. */
@@ -872,12 +803,18 @@ function parseIntent(raw) {
     "star_list",
     "unstar_list",
     "move_list_top",
+    "remind",
     "help",
   ];
   let index = null;
   if (data.index != null && data.index !== "") {
     const n = Number(data.index);
     if (Number.isFinite(n)) index = n;
+  }
+  let fire_at = "";
+  if (typeof data.fire_at === "string") fire_at = data.fire_at.trim();
+  else if (data.fire_at != null && data.fire_at !== "") {
+    fire_at = String(data.fire_at).trim();
   }
   return {
     action: allowed.includes(action) ? action : "help",
@@ -886,13 +823,100 @@ function parseIntent(raw) {
     note: typeof data.note === "string" ? data.note.trim() : "",
     query: typeof data.query === "string" ? data.query.trim() : "",
     index,
+    fire_at,
   };
+}
+
+
+function moscowNowContext() {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Moscow",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    weekday: "long",
+    hour12: false,
+  }).formatToParts(now);
+  const g = (t) => {
+    const p = parts.find((x) => x.type === t);
+    return p ? p.value : "";
+  };
+  const iso =
+    g("year") +
+    "-" +
+    g("month") +
+    "-" +
+    g("day") +
+    "T" +
+    g("hour") +
+    ":" +
+    g("minute") +
+    ":" +
+    g("second") +
+    "+03:00";
+  const human = new Intl.DateTimeFormat("ru-RU", {
+    timeZone: "Europe/Moscow",
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(now);
+  return { iso, human };
+}
+
+function formatMoscowHuman(isoOrDate) {
+  const d = new Date(isoOrDate);
+  if (!Number.isFinite(d.getTime())) return String(isoOrDate || "");
+  return new Intl.DateTimeFormat("ru-RU", {
+    timeZone: "Europe/Moscow",
+    weekday: "short",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(d);
+}
+
+function isValidFireAt(s) {
+  if (!s || typeof s !== "string") return false;
+  const t = Date.parse(s);
+  return Number.isFinite(t);
+}
+
+async function dbInsertReminder(chatId, body, fireAt) {
+  const rows = await sbRest(sbFrom("reminders"), {
+    method: "POST",
+    body: {
+      chat_id: String(chatId),
+      body,
+      fire_at: fireAt,
+      sent: false,
+    },
+  });
+  const row = Array.isArray(rows) ? rows[0] : rows;
+  return row && row.id;
 }
 
 async function interpret(userText, state, hint) {
   const snapshot = listsSnapshot(state);
+  const moscow = moscowNowContext();
   const payload =
     (hint ? "Контекст: " + hint + "\n\n" : "") +
+    "Сейчас (Europe/Moscow): " +
+    moscow.human +
+    " (" +
+    moscow.iso +
+    "). Часовой пояс всегда Europe/Moscow (+03:00).\n\n" +
     "Текущие списки:\n" +
     snapshot +
     "\n\nСообщение пользователя:\n" +
@@ -918,6 +942,7 @@ function helpText() {
     "Пришлите голосовое или текст.\n" +
     "Примеры: «в покупки купить фильтр», «покажи покупки», «удали молоко из покупок»,\n" +
     "«переименуй покупки в дела», «покупки в избранное», «подними покупки».\n" +
+    "Напоминания: «напомни завтра в 10 позвонить врачу», «напомни 29 сентября в 18:00 оплатить счёт».\n" +
     "Кнопки внизу: новая заметка, удалить, и ваши списки (★ — избранные)."
   );
 }
@@ -926,6 +951,47 @@ async function applyIntent(chatId, state, intent) {
   const action = intent.action;
   if (action === "help") {
     await sendMessage(chatId, helpText(), { reply_markup: keyboardFor(state) });
+    return;
+  }
+
+  if (action === "remind") {
+    const note = (intent.note || "").trim();
+    const fireAt = (intent.fire_at || "").trim();
+    if (!isValidFireAt(fireAt)) {
+      await sendMessage(
+        chatId,
+        note
+          ? "Когда напомнить про «" +
+            escapeHtml(note) +
+            "»? Укажите дату и время (например: завтра в 10:00)."
+          : "Когда напомнить? Укажите дату и время (например: завтра в 10:00 или 29 сентября в 18:00).",
+        { reply_markup: keyboardFor(state) }
+      );
+      return;
+    }
+    if (!note) {
+      await sendMessage(
+        chatId,
+        "О чём напомнить? Напишите текст напоминания и время.",
+        { reply_markup: keyboardFor(state) }
+      );
+      return;
+    }
+    await dbInsertReminder(chatId, note, fireAt);
+    const listName = await ensureList(state, "Напоминания");
+    const newId = await dbInsertNote(state, listName, note);
+    state.lists[listName].push(note);
+    state.noteIds[listName].push(newId);
+    syncEph(state);
+    const when = formatMoscowHuman(fireAt);
+    await sendMessage(
+      chatId,
+      "Напомню " +
+        escapeHtml(when) +
+        ": " +
+        escapeHtml(note),
+      { reply_markup: keyboardFor(state) }
+    );
     return;
   }
 
@@ -1362,7 +1428,8 @@ async function handleStart(chatId) {
   await sendMessage(
     chatId,
     "Пришлите голосовое или текст.\n" +
-      "Примеры: «в покупки купить фильтр», «покажи покупки», «удали молоко из покупок».",
+      "Примеры: «в покупки купить фильтр», «покажи покупки», «удали молоко из покупок».\n" +
+      "Можно попросить напомнить в нужное время — например «напомни завтра в 10 позвонить».",
     { reply_markup: keyboardFor(state) }
   );
 }
