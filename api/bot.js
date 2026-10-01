@@ -25,6 +25,13 @@ const NEW_NOTE_BTN = "Новая заметка";
 const DELETE_NOTE_BTN = "Удалить заметку";
 const DEFAULT_LIST = "Стикеры";
 const LEGACY_DEFAULT = "Входящие";
+const REMINDERS_LIST = "Напоминания";
+/** Lists that require explicit confirmation before delete_list. */
+const SYSTEM_LISTS = [DEFAULT_LIST, REMINDERS_LIST];
+/** Stateless callback_data for delete_list confirmation (< 64 bytes). */
+const CB_DEL_REMINDERS = "dl:r";
+const CB_DEL_STICKERS = "dl:s";
+const CB_DEL_NO = "dl:no";
 const MAX_KB_BTN = 64;
 
 const CHAT_PRIMARY = "qwen/qwen3.8-27b";
@@ -36,7 +43,7 @@ const GROQ_TRANSCRIBE_URL =
   "https://api.groq.com/openai/v1/audio/transcriptions";
 
 const SYSTEM_PROMPT = `Ты помощник по спискам заметок. Ответь СТРОГО одним JSON-объектом без markdown:
-{"action":"add"|"show"|"new_list"|"delete_last"|"delete_note"|"clear_list"|"rename_list"|"star_list"|"unstar_list"|"move_list_top"|"remind"|"help","list":"string","new_name":"string","note":"string","index":null|number,"query":"string","fire_at":null|string}
+{"action":"add"|"show"|"new_list"|"delete_last"|"delete_note"|"clear_list"|"delete_list"|"rename_list"|"star_list"|"unstar_list"|"move_list_top"|"remind"|"help","list":"string","new_name":"string","note":"string","index":null|number,"query":"string","fire_at":null|string,"cancel_reminders":false|true}
 
 Правила:
 - action=add — добавить заметку; note обязателен.
@@ -44,7 +51,12 @@ const SYSTEM_PROMPT = `Ты помощник по спискам заметок.
 - action=new_list — создать пустой список с именем list.
 - action=delete_last — удалить ПОСЛЕДНЮЮ заметку в list (если list не назван — «Стикеры»).
 - action=delete_note — удалить ОДНУ заметку: index (номер с 1) и/или query (кусок текста); list если указан.
-- action=clear_list — ТОЛЬКО если явно просят очистить весь список; list обязателен.
+- action=clear_list — ОЧИСТИТЬ список: удалить все заметки, сам список (кнопка) остаётся. Глагол «очисти». list обязателен.
+  Примеры: «очисти напоминания» → {"action":"clear_list","list":"Напоминания"}; «очисти список покупки», «очисти покупки» → {"action":"clear_list","list":"покупки"}.
+  cancel_reminders=true ТОЛЬКО если пользователь явно просит отменить напоминания: «отмени напоминания», «очисти напоминания и отмени их» → {"action":"clear_list","list":"Напоминания","cancel_reminders":true}. Иначе cancel_reminders=false (будущие напоминания не трогаем).
+- action=delete_list — УДАЛИТЬ список целиком: и заметки, и сам список (кнопка пропадёт). Сигнал — слово «список» сразу после «удали»/«убери», или «целиком».
+  Примеры: «удали список напоминания» → {"action":"delete_list","list":"Напоминания"}; «убери список покупки», «удали покупки целиком» → {"action":"delete_list","list":"покупки"}.
+- Различай: «очисти X» → clear_list; «удали список X» / «убери список X» → delete_list; «удали молоко из покупок» / «удали вторую заметку» → delete_note.
 - action=rename_list — переименовать: list = старое имя, new_name = новое («переименуй X в Y», «назови X Y»).
 - action=star_list — добавить список в избранное («X в избранное», «звезда на X»).
 - action=unstar_list — убрать из избранного («убери звезду с X»).
@@ -113,6 +125,7 @@ function getEph(chatId) {
     ephemeral.set(key, {
       step: null,
       pendingDeletes: null,
+      pendingListDelete: null,
       warnedEphemeral: false,
     });
   }
@@ -123,6 +136,7 @@ function syncEph(state) {
   const e = state._eph;
   e.step = state.step;
   e.pendingDeletes = state.pendingDeletes;
+  e.pendingListDelete = state.pendingListDelete || null;
   e.warnedEphemeral = state.warnedEphemeral;
 }
 
@@ -161,6 +175,7 @@ async function loadChat(chatId) {
     starred: [],
     step: eph.step,
     pendingDeletes: eph.pendingDeletes,
+    pendingListDelete: eph.pendingListDelete || null,
     warnedEphemeral: eph.warnedEphemeral,
     _eph: eph,
   };
@@ -345,6 +360,61 @@ async function dbClearNotes(state, listName) {
       encodeURIComponent(listName),
     { method: "DELETE", headers: sbHeaders({ Prefer: "return=minimal" }) }
   );
+}
+
+/** Delete all notes of a list; returns number of deleted rows. */
+async function dbDeleteNotesCount(state, listName) {
+  const rows = await sbRest(
+    sbFrom("notes") + "?chat_id=eq." +
+      encodeURIComponent(state.chatId) +
+      "&list_name=eq." +
+      encodeURIComponent(listName) +
+      "&select=id",
+    {
+      method: "DELETE",
+      headers: sbHeaders({ Prefer: "return=representation" }),
+    }
+  );
+  if (Array.isArray(rows)) return rows.length;
+  return (state.lists[listName] || []).length;
+}
+
+async function dbDeleteListRow(state, name) {
+  await sbRest(
+    sbFrom("lists") + "?chat_id=eq." +
+      encodeURIComponent(state.chatId) +
+      "&name=eq." +
+      encodeURIComponent(name),
+    { method: "DELETE", headers: sbHeaders({ Prefer: "return=minimal" }) }
+  );
+}
+
+/** Cancel (delete) all unsent reminders of chat; returns count. */
+async function dbCancelUnsentReminders(chatId) {
+  const rows = await sbRest(
+    sbFrom("reminders") + "?chat_id=eq." +
+      encodeURIComponent(String(chatId)) +
+      "&sent=eq.false&select=id",
+    {
+      method: "DELETE",
+      headers: sbHeaders({ Prefer: "return=representation" }),
+    }
+  );
+  return Array.isArray(rows) ? rows.length : 0;
+}
+
+/** Count unsent reminders; null if query failed. */
+async function dbCountUnsentReminders(chatId) {
+  try {
+    const rows = await sbRest(
+      sbFrom("reminders") + "?chat_id=eq." +
+        encodeURIComponent(String(chatId)) +
+        "&sent=eq.false&select=id"
+    );
+    return Array.isArray(rows) ? rows.length : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 async function dbSetStarred(state, name, starred) {
@@ -799,6 +869,7 @@ function parseIntent(raw) {
     "delete_last",
     "delete_note",
     "clear_list",
+    "delete_list",
     "rename_list",
     "star_list",
     "unstar_list",
@@ -816,8 +887,12 @@ function parseIntent(raw) {
   else if (data.fire_at != null && data.fire_at !== "") {
     fire_at = String(data.fire_at).trim();
   }
+  const cr = data.cancel_reminders;
+  const cancel_reminders =
+    cr === true || (typeof cr === "string" && cr.trim().toLowerCase() === "true");
   return {
     action: allowed.includes(action) ? action : "help",
+    cancel_reminders,
     list: typeof data.list === "string" ? data.list.trim() : "",
     new_name: typeof data.new_name === "string" ? data.new_name.trim() : "",
     note: typeof data.note === "string" ? data.note.trim() : "",
@@ -937,11 +1012,268 @@ async function interpret(userText, state, hint) {
   return parseIntent(content);
 }
 
+function normListName(s) {
+  return String(s || "")
+    .replace(/^★\s*/, "")
+    .replace(/[«»"“”„]/g, "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase()
+    .replace(/ё/g, "е");
+}
+
+/** Find existing list by name: exact, then trimmed / case-insensitive. */
+function resolveExistingList(state, raw) {
+  const want = String(raw || "").trim();
+  if (!want) return null;
+  if (Array.isArray(state.lists[want])) return want;
+  const btn = resolveListButton(state, want);
+  if (btn) return btn;
+  const key = normListName(want);
+  if (!key) return null;
+  const names = listNames(state);
+  for (const n of names) {
+    if (normListName(n) === key) return n;
+  }
+  return null;
+}
+
+function isSystemList(name) {
+  return SYSTEM_LISTS.includes(name);
+}
+
+function pluralRu(n, one, few, many) {
+  const a = Math.abs(Number(n)) % 100;
+  const b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b === 1) return one;
+  if (b >= 2 && b <= 4) return few;
+  return many;
+}
+
+function notesCountRu(n) {
+  return n + " " + pluralRu(n, "заметка", "заметки", "заметок");
+}
+
+function remindersCountRu(n) {
+  return n + " " + pluralRu(n, "напоминание", "напоминания", "напоминаний");
+}
+
+function noSuchListText(state, raw) {
+  const names = listNames(state);
+  return (
+    "Списка «" +
+    escapeHtml(String(raw || "").trim()) +
+    "» нет." +
+    (names.length
+      ? " Есть: " + names.map((n) => "«" + escapeHtml(n) + "»").join(", ") + "."
+      : "")
+  );
+}
+
+const RE_DELETE_LIST = /(^|[^а-яё])(удали|удалить|убери|убрать)\s+(весь\s+|целый\s+|этот\s+)?список/i;
+const RE_DELETE_WHOLE = /(^|[^а-яё])(удали|удалить|убери|убрать)\s.*целиком/i;
+const RE_CLEAR = /(^|[^а-яё])(очисти|очистить|очисть)/i;
+// «отмени напоминания», «очисти напоминания и отмени их», «отмени все напоминания».
+// Singular «отмени напоминание про …» does NOT match (never cancel everything by accident).
+const RE_CANCEL_REM = /(^|[^а-яё])отмен\S*\s+(пожалуйста\s+|все\s+|всё\s+|мои\s+|будущие\s+)*(их|напоминания|напоминаний)\s*(тоже|все|всё|пожалуйста)?\s*[.!]*\s*$/i;
+const RE_PLURAL_REM = /(^|[^а-яё])(их|напоминания|напоминаний)([^а-яё]|$)/i;
+const RE_NOT_CANCEL = /(^|[^а-яё])не\s+отмен/i;
+
+/**
+ * Deterministic guardrails over the model's JSON for clear/delete list.
+ * cancel_reminders is only true when the user text explicitly asks to cancel.
+ */
+function refineIntent(userText, intent) {
+  const t = String(userText || "");
+  const out = Object.assign({}, intent);
+  const tc = t.replace(/[,;]/g, " ");
+  const explicitCancel =
+    /отмен/i.test(tc) && !RE_NOT_CANCEL.test(tc) &&
+    (RE_CANCEL_REM.test(tc) ||
+      (intent.cancel_reminders === true && RE_PLURAL_REM.test(tc)));
+  out.cancel_reminders = Boolean(explicitCancel);
+
+  const wantsDeleteList = RE_DELETE_LIST.test(t) || RE_DELETE_WHOLE.test(t);
+  const wantsClear = RE_CLEAR.test(t);
+
+  if (wantsDeleteList && !wantsClear &&
+      (out.action === "delete_note" || out.action === "clear_list" ||
+       out.action === "delete_last" || out.action === "help")) {
+    if (out.list || out.action !== "help") out.action = "delete_list";
+  } else if (wantsClear && out.action === "delete_list") {
+    out.action = "clear_list";
+  }
+
+  if (out.cancel_reminders && out.action !== "delete_list") {
+    if (out.action !== "clear_list" || !out.list) {
+      out.action = "clear_list";
+      out.list = REMINDERS_LIST;
+    }
+  }
+  return out;
+}
+
+/** clear_list: delete notes of a list, keep the list row. */
+async function performClearList(chatId, state, rawName, cancelReminders) {
+  if (!rawName) {
+    await sendMessage(
+      chatId,
+      "Какой список очистить? Например: «очисти покупки».",
+      { reply_markup: keyboardFor(state) }
+    );
+    return;
+  }
+  let name = resolveExistingList(state, rawName);
+  const isRem =
+    name === REMINDERS_LIST ||
+    (!name && normListName(rawName) === normListName(REMINDERS_LIST));
+  if (!name && !(isRem && cancelReminders)) {
+    await sendMessage(chatId, noSuchListText(state, rawName), {
+      reply_markup: keyboardFor(state),
+    });
+    return;
+  }
+  let n = 0;
+  if (name) {
+    n = await dbDeleteNotesCount(state, name);
+    state.lists[name] = [];
+    state.noteIds[name] = [];
+  }
+  let tail = "";
+  if (isRem) {
+    if (cancelReminders) {
+      const k = await dbCancelUnsentReminders(chatId);
+      tail =
+        k > 0
+          ? " Отменено будущих напоминаний: " + k + "."
+          : " Будущих напоминаний не было.";
+    } else {
+      const k = await dbCountUnsentReminders(chatId);
+      tail =
+        k && k > 0
+          ? " Будущие напоминания (" +
+            remindersCountRu(k) +
+            ") не тронуты — придут в срок. Отменить: «отмени напоминания»."
+          : " Будущие напоминания не тронуты.";
+    }
+  }
+  state.step = null;
+  state.pendingListDelete = null;
+  syncEph(state);
+  const head = name
+    ? "Список «" + escapeHtml(name) + "» очищен (" + notesCountRu(n) + ")."
+    : "Списка «" + escapeHtml(REMINDERS_LIST) + "» нет.";
+  await sendMessage(chatId, head + tail, { reply_markup: keyboardFor(state) });
+}
+
+function deleteConfirmText(name) {
+  if (name === REMINDERS_LIST) {
+    return "Точно удалить список Напоминания? Тогда пропадут и будущие напоминания в этом списке.";
+  }
+  return "Точно удалить список " + escapeHtml(name) + "? Все заметки в нём пропадут.";
+}
+
+function deleteConfirmKeyboard(name) {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: "Да, удалить",
+          callback_data: name === REMINDERS_LIST ? CB_DEL_REMINDERS : CB_DEL_STICKERS,
+        },
+        { text: "Отмена", callback_data: CB_DEL_NO },
+      ],
+    ],
+  };
+}
+
+/** Actually delete list row + notes (+ unsent reminders for «Напоминания»). */
+async function performDeleteList(chatId, state, name) {
+  const n = await dbDeleteNotesCount(state, name);
+  let k = null;
+  if (name === REMINDERS_LIST) {
+    k = await dbCancelUnsentReminders(chatId);
+  }
+  await dbDeleteListRow(state, name);
+  delete state.lists[name];
+  delete state.noteIds[name];
+  state.order = (state.order || []).filter((x) => x !== name);
+  state.starred = (state.starred || []).filter((x) => x !== name);
+  if (name === DEFAULT_LIST) {
+    // Default list comes back empty (loadChat would re-create it anyway).
+    await ensureDefaultListDb(state);
+  }
+  await dbWriteSortOrders(
+    state,
+    state.order.filter((x) => Array.isArray(state.lists[x]))
+  );
+  state.step = null;
+  state.pendingListDelete = null;
+  state.pendingDeletes = null;
+  syncEph(state);
+  let text = "Список «" + escapeHtml(name) + "» удалён (" + notesCountRu(n) + ").";
+  if (name === REMINDERS_LIST) {
+    text +=
+      " Отменено будущих напоминаний: " +
+      (k || 0) +
+      ". Следующее «напомни …» создаст список заново.";
+  } else if (name === DEFAULT_LIST) {
+    text += " Стикеры — список по умолчанию, вернётся пустым.";
+  }
+  await sendMessage(chatId, text, { reply_markup: keyboardFor(state) });
+}
+
+/** delete_list entry: system lists ask for confirmation, others delete now. */
+async function requestDeleteList(chatId, state, rawName) {
+  if (!rawName) {
+    await sendMessage(
+      chatId,
+      "Какой список удалить? Например: «удали список покупки».",
+      { reply_markup: keyboardFor(state) }
+    );
+    return;
+  }
+  const name = resolveExistingList(state, rawName);
+  if (!name) {
+    await sendMessage(chatId, noSuchListText(state, rawName), {
+      reply_markup: keyboardFor(state),
+    });
+    return;
+  }
+  if (isSystemList(name)) {
+    state.step = "await_delete_list_confirm";
+    state.pendingListDelete = name;
+    syncEph(state);
+    await sendMessage(chatId, deleteConfirmText(name), {
+      reply_markup: deleteConfirmKeyboard(name),
+    });
+    return;
+  }
+  await performDeleteList(chatId, state, name);
+}
+
+function isYesDelete(text) {
+  const t = String(text || "")
+    .toLowerCase()
+    .replace(/[.!,;:…]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return /^да( удали| удалить| удаляй| точно)?$/.test(t);
+}
+
+function isNoDelete(text) {
+  const t = String(text || "").toLowerCase().replace(/[.!,;:…]+/g, " ").trim();
+  return /^(нет|не надо|не удаляй|отмена|отмени)$/.test(t);
+}
+
 function helpText() {
   return (
     "Пришлите голосовое или текст.\n" +
     "Примеры: «в покупки купить фильтр», «покажи покупки», «удали молоко из покупок»,\n" +
     "«переименуй покупки в дела», «покупки в избранное», «подними покупки».\n" +
+    "«очисти покупки» — убрать все заметки, список остаётся; «удали список покупки» — удалить список целиком.\n" +
+    "«отмени напоминания» — очистить «Напоминания» и отменить будущие напоминания.\n" +
     "Напоминания: «напомни завтра в 10 позвонить врачу», «напомни 29 сентября в 18:00 оплатить счёт».\n" +
     "Кнопки внизу: новая заметка, удалить, и ваши списки (★ — избранные)."
   );
@@ -1011,25 +1343,17 @@ async function applyIntent(chatId, state, intent) {
   }
 
   if (action === "clear_list") {
-    if (!intent.list) {
-      await sendMessage(
-        chatId,
-        "Какой список очистить целиком? Напишите имя.",
-        { reply_markup: keyboardFor(state) }
-      );
-      return;
-    }
-    const name = await ensureList(state, intent.list);
-    const n = (state.lists[name] || []).length;
-    await dbClearNotes(state, name);
-    state.lists[name] = [];
-    state.noteIds[name] = [];
-    syncEph(state);
-    await sendMessage(
+    await performClearList(
       chatId,
-      "Очистил «" + escapeHtml(name) + "» (" + n + ").",
-      { reply_markup: keyboardFor(state) }
+      state,
+      (intent.list || "").trim(),
+      Boolean(intent.cancel_reminders)
     );
+    return;
+  }
+
+  if (action === "delete_list") {
+    await requestDeleteList(chatId, state, (intent.list || "").trim());
     return;
   }
 
@@ -1325,6 +1649,36 @@ async function processUserText(chatId, text) {
     return;
   }
 
+  if (state.step === "await_delete_list_confirm") {
+    const pending = state.pendingListDelete;
+    state.step = null;
+    state.pendingListDelete = null;
+    syncEph(state);
+    if (pending && isYesDelete(text)) {
+      const name = resolveExistingList(state, pending);
+      if (!name) {
+        await sendMessage(chatId, noSuchListText(state, pending), {
+          reply_markup: keyboardFor(state),
+        });
+        return;
+      }
+      try {
+        await performDeleteList(chatId, state, name);
+      } catch (err) {
+        await sendMessage(chatId, dbFailMessage(err), {
+          reply_markup: keyboardFor(state),
+        });
+      }
+      return;
+    }
+    if (pending && isNoDelete(text)) {
+      await sendMessage(chatId, "Ок, не удаляю.", {
+        reply_markup: keyboardFor(state),
+      });
+      return;
+    }
+  }
+
   if (state.step === "await_delete_pick" && state.pendingDeletes) {
     const m = String(text || "").trim().match(/^[1-3]$/);
     if (m) {
@@ -1382,7 +1736,7 @@ async function processUserText(chatId, text) {
 
   const deleteHint =
     state.step === "await_delete"
-      ? "Пользователь удаляет заметку. Выбери delete_note, delete_last или clear_list."
+      ? "Пользователь удаляет заметку. Выбери delete_note, delete_last, clear_list («очисти X») или delete_list («удали список X»)."
       : "";
   if (state.step === "await_delete" || state.step === "await_note") {
     state.step = null;
@@ -1391,7 +1745,7 @@ async function processUserText(chatId, text) {
 
   let intent;
   try {
-    intent = await interpret(text, state, deleteHint);
+    intent = refineIntent(text, await interpret(text, state, deleteHint));
   } catch (_) {
     await sendMessage(
       chatId,
@@ -1424,6 +1778,7 @@ async function handleStart(chatId) {
   }
   state.step = null;
   state.pendingDeletes = null;
+  state.pendingListDelete = null;
   syncEph(state);
   await sendMessage(
     chatId,
@@ -1444,6 +1799,7 @@ async function handleCancel(chatId) {
   }
   state.step = null;
   state.pendingDeletes = null;
+  state.pendingListDelete = null;
   syncEph(state);
   await sendMessage(chatId, "Ок, отменил.", {
     reply_markup: keyboardFor(state),
@@ -1481,7 +1837,7 @@ async function handleDeletePrompt(chatId) {
   syncEph(state);
   await sendMessage(
     chatId,
-    "Какую удалить? Можно голосом или текстом: номер, кусок текста или список целиком.",
+    "Какую удалить? Можно голосом или текстом: номер или кусок текста. «Очисти X» — очистить список, «удали список X» — удалить список.",
     { reply_markup: keyboardFor(state) }
   );
 }
@@ -1498,6 +1854,55 @@ async function handleShowList(chatId, listName) {
   await showListMessage(chatId, state, name);
 }
 
+async function handleDeleteListCallback(cq, chatId, data) {
+  // Drop the inline buttons so the confirmation can't be pressed twice.
+  try {
+    if (cq.message && cq.message.message_id != null) {
+      await tg("editMessageReplyMarkup", {
+        chat_id: chatId,
+        message_id: cq.message.message_id,
+        reply_markup: { inline_keyboard: [] },
+      });
+    }
+  } catch (_) {}
+  let state;
+  try {
+    state = await loadChat(chatId);
+  } catch (err) {
+    await sendMessage(chatId, dbFailMessage(err));
+    return;
+  }
+  state.step = null;
+  state.pendingListDelete = null;
+  syncEph(state);
+  if (data === CB_DEL_NO) {
+    await sendMessage(chatId, "Ок, не удаляю.", {
+      reply_markup: keyboardFor(state),
+    });
+    return;
+  }
+  const target =
+    data === CB_DEL_REMINDERS
+      ? REMINDERS_LIST
+      : data === CB_DEL_STICKERS
+        ? DEFAULT_LIST
+        : null;
+  if (!target) return;
+  if (!Array.isArray(state.lists[target])) {
+    await sendMessage(chatId, noSuchListText(state, target), {
+      reply_markup: keyboardFor(state),
+    });
+    return;
+  }
+  try {
+    await performDeleteList(chatId, state, target);
+  } catch (err) {
+    await sendMessage(chatId, dbFailMessage(err), {
+      reply_markup: keyboardFor(state),
+    });
+  }
+}
+
 async function handleCallbackQuery(cq) {
   if (!cq || !cq.message || !cq.message.chat) return;
   const chatId = cq.message.chat.id;
@@ -1505,6 +1910,10 @@ async function handleCallbackQuery(cq) {
   try {
     await tg("answerCallbackQuery", { callback_query_id: cq.id });
   } catch (_) {}
+  if (data.startsWith("dl:")) {
+    await handleDeleteListCallback(cq, chatId, data);
+    return;
+  }
   let state;
   try {
     state = await loadChat(chatId);
@@ -1687,4 +2096,16 @@ module.exports = async function handler(req, res) {
       error: String((err && err.message) || err),
     });
   }
+};
+
+// Internal helpers for local unit tests (not used by Vercel routing).
+module.exports._test = {
+  parseIntent,
+  refineIntent,
+  resolveExistingList,
+  applyIntent,
+  handleCallbackQuery,
+  processUserText,
+  isYesDelete,
+  isBotCommand,
 };
